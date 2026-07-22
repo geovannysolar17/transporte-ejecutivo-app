@@ -324,6 +324,329 @@ try { localStorage.setItem('cotizador_rutas_personalizadas', JSON.stringify(RUTA
 }
 }
 
+// ============================================================================================
+// MÓDULO MAESTRO SOLAR VIP: LUGARES, PEAJES Y RUTAS (arquitectura aprobada por el usuario)
+// ============================================================================================
+// Principios obligatorios de esta arquitectura:
+// 1. Todo se relaciona por ID, nunca por texto repetido. Un "Peaje" es un registro único; las
+//    Rutas solo GUARDAN una lista ordenada de peajeId — nunca copian el nombre ni el valor.
+// 2. Ningún total se guarda fijo. Total Solo Ida y Total Ida y Regreso se calculan siempre en
+//    vivo a partir de los peajes actuales de la ruta. Si cambia un valor en Administrar Peajes,
+//    todas las rutas que usan ese peaje quedan actualizadas automáticamente, sin tocarlas.
+// 3. El nombre/valor de un peaje SOLO se edita desde Administrar Peajes. Una ruta nunca crea
+//    peajes nuevos, solo selecciona de los ya existentes.
+// 4. Lugares tiene un campo `tipo` desde ya (ciudad/municipio/hotel/aeropuerto/clínica/empresa/
+//    centro_comercial/terminal/turistico) para que el buscador crezca sin rediseñar nada.
+// 5. Lugares y Rutas ya traen los campos lat/lng y kmFuente preparados (vacíos por ahora) para
+//    integrar Google Maps/Waze en el futuro sin romper esta estructura.
+// 6. Este módulo es COMPLETAMENTE INDEPENDIENTE del sistema viejo (CIUDADES/DISTANCIAS/
+//    RUTAS_ESPECIALES) que sigue usando la pestaña "Cotizar" tal como está hoy. La integración
+//    de este motor nuevo dentro de Cotizar será una fase posterior, aprobada por separado.
+// ============================================================================================
+
+var SolarDB = (function() {
+
+function nuevoId(prefijo) {
+return prefijo + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+// ---------- LUGARES ----------
+var LUGARES = [];
+
+function seedLugares() {
+var municipiosPorDepto = {
+"Magdalena": ["Ciénaga", "Santa Marta", "Aracataca", "Fundación", "El Retén"],
+"Cesar": ["Bosconia", "Valledupar", "Aguachica"],
+"La Guajira": ["Palomino", "Riohacha", "Maicao"],
+"Bolívar": ["Cartagena"],
+"Sucre": ["Sincelejo", "Tolú", "Coveñas"],
+"Córdoba": ["Montería"]
+};
+var lugares = [{ id: 'lugar_barranquilla', nombre: 'Barranquilla', tipo: 'ciudad', departamento: 'Atlántico', municipioId: null, lat: null, lng: null }];
+Object.keys(municipiosPorDepto).forEach(function(depto) {
+municipiosPorDepto[depto].forEach(function(nombreMun) {
+lugares.push({ id: nuevoId('lugar'), nombre: nombreMun, tipo: 'ciudad', departamento: depto, municipioId: null, lat: null, lng: null });
+});
+});
+return lugares;
+}
+
+function buscarLugarPorNombre(nombre) {
+return LUGARES.find(function(l){ return l.nombre.toLowerCase() === nombre.toLowerCase(); });
+}
+
+function obtenerLugar(id) {
+return LUGARES.find(function(l){ return l.id === id; });
+}
+
+// El buscador: hoy solo filtra "ciudad", pero el campo `tipo` ya soporta cualquier otro valor
+// (hotel, aeropuerto, clínica, empresa, centro_comercial, terminal, turístico) sin cambiar esta función.
+function buscarLugares(query, tipos) {
+query = (query || '').trim().toLowerCase();
+return LUGARES.filter(function(l) {
+if (tipos && tipos.length && tipos.indexOf(l.tipo) === -1) return false;
+if (!query) return true;
+return l.nombre.toLowerCase().indexOf(query) !== -1 ||
+(l.departamento || '').toLowerCase().indexOf(query) !== -1;
+});
+}
+
+function crearLugar(datos) {
+var existente = buscarLugarPorNombre(datos.nombre);
+if (existente) return { ok: false, error: 'Ya existe un lugar llamado "' + datos.nombre + '"', lugar: existente };
+var lugar = {
+id: nuevoId('lugar'), nombre: datos.nombre, tipo: datos.tipo || 'ciudad',
+departamento: datos.departamento || '', municipioId: datos.municipioId || null,
+lat: datos.lat || null, lng: datos.lng || null
+};
+LUGARES.push(lugar);
+guardarLugares();
+return { ok: true, lugar: lugar };
+}
+
+function guardarLugares() {
+try { localStorage.setItem('solarvip_lugares', JSON.stringify(LUGARES)); } catch(e) {}
+}
+
+function cargarLugares() {
+try {
+var raw = localStorage.getItem('solarvip_lugares');
+if (raw) { LUGARES = JSON.parse(raw); return; }
+} catch(e) {}
+LUGARES = seedLugares();
+guardarLugares();
+}
+
+// ---------- PEAJES ----------
+var PEAJES = [];
+
+function seedPeajes() {
+// Peajes reales conocidos hasta ahora. Cada uno es un registro ÚNICO — Cartagena reutiliza
+// varios de estos mismos peajes (Bayunca, Marahuaco, etc.) entre sus 5 rutas, por eso viven
+// aquí una sola vez y las rutas solo los referencian por ID.
+var datos = [
+{ nombre: 'Puerto Colombia', departamento: 'Atlántico', municipio: 'Puerto Colombia', valorCategoriaI: 12000 },
+{ nombre: 'Marahuaco', departamento: 'Bolívar', municipio: 'Cartagena', valorCategoriaI: 22200 },
+{ nombre: 'Sabanagrande', departamento: 'Atlántico', municipio: 'Sabanagrande', valorCategoriaI: 12600 },
+{ nombre: 'Bayunca', departamento: 'Bolívar', municipio: 'Cartagena', valorCategoriaI: 12600 },
+{ nombre: 'Baranoa', departamento: 'Atlántico', municipio: 'Baranoa', valorCategoriaI: 12600 },
+{ nombre: 'Puente Laureano', departamento: 'Magdalena', municipio: 'Ciénaga', valorCategoriaI: 17300 },
+{ nombre: 'Tasajera', departamento: 'Magdalena', municipio: 'Ciénaga', valorCategoriaI: 17300 }
+];
+return datos.map(function(d) {
+return { id: nuevoId('peaje'), nombre: d.nombre, departamento: d.departamento, municipio: d.municipio, valorCategoriaI: d.valorCategoriaI, estado: 'activo', observaciones: '' };
+});
+}
+
+function obtenerPeaje(id) {
+return PEAJES.find(function(p){ return p.id === id; });
+}
+
+function listarPeajes() {
+return PEAJES.slice();
+}
+
+function buscarPeajePorNombre(nombre, departamento) {
+return PEAJES.find(function(p){
+return p.nombre.trim().toLowerCase() === nombre.trim().toLowerCase() &&
+(!departamento || (p.departamento||'').toLowerCase() === departamento.toLowerCase());
+});
+}
+
+function crearPeaje(datos) {
+var dup = buscarPeajePorNombre(datos.nombre, datos.departamento);
+if (dup) return { ok: false, error: 'Ya existe el peaje "' + dup.nombre + '" en ' + (dup.departamento||'ese departamento') + ' — edítalo en vez de crear uno nuevo.', peaje: dup };
+var peaje = {
+id: nuevoId('peaje'), nombre: datos.nombre, departamento: datos.departamento || '',
+municipio: datos.municipio || '', valorCategoriaI: parseFloat(datos.valorCategoriaI) || 0,
+estado: datos.estado || 'activo', observaciones: datos.observaciones || ''
+};
+PEAJES.push(peaje);
+guardarPeajes();
+return { ok: true, peaje: peaje };
+}
+
+function editarPeaje(id, cambios) {
+var peaje = obtenerPeaje(id);
+if (!peaje) return { ok: false, error: 'Peaje no encontrado' };
+if (cambios.nombre !== undefined) peaje.nombre = cambios.nombre;
+if (cambios.departamento !== undefined) peaje.departamento = cambios.departamento;
+if (cambios.municipio !== undefined) peaje.municipio = cambios.municipio;
+if (cambios.valorCategoriaI !== undefined) peaje.valorCategoriaI = parseFloat(cambios.valorCategoriaI) || 0;
+if (cambios.estado !== undefined) peaje.estado = cambios.estado;
+if (cambios.observaciones !== undefined) peaje.observaciones = cambios.observaciones;
+guardarPeajes();
+// Como las rutas solo guardan el peajeId y nunca copian el valor, todas las rutas que usan
+// este peaje quedan automáticamente actualizadas — no hace falta tocar ninguna ruta.
+return { ok: true, peaje: peaje };
+}
+
+function guardarPeajes() {
+try { localStorage.setItem('solarvip_peajes', JSON.stringify(PEAJES)); } catch(e) {}
+}
+
+function cargarPeajes() {
+try {
+var raw = localStorage.getItem('solarvip_peajes');
+if (raw) { PEAJES = JSON.parse(raw); return; }
+} catch(e) {}
+PEAJES = seedPeajes();
+guardarPeajes();
+}
+
+// ---------- RUTAS ----------
+var RUTAS = [];
+
+function seedRutas() {
+var rutas = [];
+var barranquillaId = 'lugar_barranquilla';
+
+function idPeaje(nombre) { var p = buscarPeajePorNombre(nombre); return p ? p.id : null; }
+function idLugar(nombre) { var l = buscarLugarPorNombre(nombre); return l ? l.id : null; }
+
+function agregarRuta(nombreDestino, nombreRutaTexto, kmEstimado, tiempoMin, nombresPeajes) {
+var destinoId = idLugar(nombreDestino);
+if (!destinoId) return;
+rutas.push({
+id: nuevoId('ruta'), origenId: barranquillaId, destinoId: destinoId, nombreRuta: nombreRutaTexto,
+kilometros: kmEstimado, tiempoMinutos: tiempoMin, estado: 'activo', kmFuente: 'manual',
+peajesRuta: nombresPeajes.map(function(n, i) { var pid = idPeaje(n); return pid ? { peajeId: pid, orden: i } : null; }).filter(Boolean)
+});
+}
+
+// Cartagena: las 5 rutas obligatorias
+agregarRuta('Cartagena', 'Vía al Mar', 120, 180, ['Puerto Colombia', 'Marahuaco']);
+agregarRuta('Cartagena', 'La Cordialidad (Sabanagrande - Bayunca)', 130, 165, ['Sabanagrande', 'Bayunca']);
+agregarRuta('Cartagena', 'La Cordialidad (Sabanagrande - Marahuaco)', 128, 165, ['Sabanagrande', 'Marahuaco']);
+agregarRuta('Cartagena', 'La Cordialidad (Baranoa - Bayunca)', 132, 170, ['Baranoa', 'Bayunca']);
+agregarRuta('Cartagena', 'La Cordialidad (Baranoa - Marahuaco)', 130, 170, ['Baranoa', 'Marahuaco']);
+
+// Santa Marta: ruta única conocida con sus peajes reales
+agregarRuta('Santa Marta', 'Ruta Cordialidad / Troncal Caribe', 106, 120, ['Puente Laureano', 'Tasajera']);
+
+// Demás municipios: quedan preparados como rutas activas SIN peajes todavía (el usuario los
+// completará desde Administrar Rutas cuando tenga el dato real — nunca se inventa un peaje).
+['Ciénaga', 'Aracataca', 'Fundación', 'El Retén', 'Bosconia', 'Valledupar', 'Aguachica',
+ 'Palomino', 'Riohacha', 'Maicao', 'Sincelejo', 'Tolú', 'Coveñas', 'Montería'].forEach(function(nombreDestino) {
+if (nombreDestino === 'Santa Marta') return; // ya tiene ruta
+agregarRuta(nombreDestino, 'Ruta principal', null, null, []);
+});
+
+return rutas;
+}
+
+function obtenerRuta(id) {
+return RUTAS.find(function(r){ return r.id === id; });
+}
+
+function rutasEntre(origenId, destinoId) {
+return RUTAS.filter(function(r) {
+return r.estado === 'activo' &&
+((r.origenId === origenId && r.destinoId === destinoId) || (r.origenId === destinoId && r.destinoId === origenId));
+});
+}
+
+function calcularTotalesRuta(ruta) {
+var totalIda = ruta.peajesRuta.reduce(function(s, pr) {
+var peaje = obtenerPeaje(pr.peajeId);
+return s + (peaje && peaje.estado === 'activo' ? peaje.valorCategoriaI : 0);
+}, 0);
+return { cantidadPeajes: ruta.peajesRuta.length, totalSoloIda: totalIda, totalIdaRegreso: totalIda * 2 };
+}
+
+function crearRuta(datos) {
+var ruta = {
+id: nuevoId('ruta'), origenId: datos.origenId, destinoId: datos.destinoId,
+nombreRuta: datos.nombreRuta || 'Ruta principal', kilometros: datos.kilometros || null,
+tiempoMinutos: datos.tiempoMinutos || null, estado: 'activo', kmFuente: 'manual',
+peajesRuta: datos.peajesRuta || []
+};
+RUTAS.push(ruta);
+guardarRutas();
+return { ok: true, ruta: ruta };
+}
+
+function editarRuta(id, cambios) {
+var ruta = obtenerRuta(id);
+if (!ruta) return { ok: false, error: 'Ruta no encontrada' };
+['nombreRuta', 'kilometros', 'tiempoMinutos', 'estado'].forEach(function(campo) {
+if (cambios[campo] !== undefined) ruta[campo] = cambios[campo];
+});
+guardarRutas();
+return { ok: true, ruta: ruta };
+}
+
+// Agrega un peaje EXISTENTE a la ruta (nunca crea uno nuevo)
+function agregarPeajeARuta(rutaId, peajeId) {
+var ruta = obtenerRuta(rutaId);
+if (!ruta) return { ok: false, error: 'Ruta no encontrada' };
+if (!obtenerPeaje(peajeId)) return { ok: false, error: 'Ese peaje no existe' };
+if (ruta.peajesRuta.some(function(pr){ return pr.peajeId === peajeId; })) return { ok: false, error: 'Ese peaje ya está en la ruta' };
+var maxOrden = ruta.peajesRuta.reduce(function(m, pr){ return Math.max(m, pr.orden); }, -1);
+ruta.peajesRuta.push({ peajeId: peajeId, orden: maxOrden + 1 });
+guardarRutas();
+return { ok: true, ruta: ruta };
+}
+
+function quitarPeajeDeRuta(rutaId, peajeId) {
+var ruta = obtenerRuta(rutaId);
+if (!ruta) return { ok: false, error: 'Ruta no encontrada' };
+ruta.peajesRuta = ruta.peajesRuta.filter(function(pr){ return pr.peajeId !== peajeId; });
+guardarRutas();
+return { ok: true, ruta: ruta };
+}
+
+function moverPeajeEnRuta(rutaId, peajeId, direccion) {
+var ruta = obtenerRuta(rutaId);
+if (!ruta) return { ok: false, error: 'Ruta no encontrada' };
+var ordenado = ruta.peajesRuta.slice().sort(function(a,b){ return a.orden - b.orden; });
+var idx = ordenado.findIndex(function(pr){ return pr.peajeId === peajeId; });
+var destino = idx + (direccion === 'arriba' ? -1 : 1);
+if (idx < 0 || destino < 0 || destino >= ordenado.length) return { ok: false, error: 'No se puede mover' };
+var tmp = ordenado[idx].orden;
+ordenado[idx].orden = ordenado[destino].orden;
+ordenado[destino].orden = tmp;
+guardarRutas();
+return { ok: true, ruta: ruta };
+}
+
+function guardarRutas() {
+try { localStorage.setItem('solarvip_rutas', JSON.stringify(RUTAS)); } catch(e) {}
+}
+
+function cargarRutas() {
+try {
+var raw = localStorage.getItem('solarvip_rutas');
+if (raw) { RUTAS = JSON.parse(raw); return; }
+} catch(e) {}
+RUTAS = seedRutas();
+guardarRutas();
+}
+
+function inicializar() {
+cargarLugares();
+cargarPeajes();
+cargarRutas();
+}
+
+return {
+inicializar: inicializar,
+// Lugares
+buscarLugares: buscarLugares, crearLugar: crearLugar, obtenerLugar: obtenerLugar,
+get LUGARES() { return LUGARES; },
+// Peajes
+listarPeajes: listarPeajes, crearPeaje: crearPeaje, editarPeaje: editarPeaje, obtenerPeaje: obtenerPeaje,
+get PEAJES() { return PEAJES; },
+// Rutas
+obtenerRuta: obtenerRuta, rutasEntre: rutasEntre, calcularTotalesRuta: calcularTotalesRuta,
+crearRuta: crearRuta, editarRuta: editarRuta,
+agregarPeajeARuta: agregarPeajeARuta, quitarPeajeDeRuta: quitarPeajeDeRuta, moverPeajeEnRuta: moverPeajeEnRuta,
+get RUTAS() { return RUTAS; }
+};
+})();
+
+SolarDB.inicializar();
+
 let VEHICULO = {
 marca: "Renault", modelo: "Duster Iconic", motor: "1.3 Turbo", anio: "2026", placa: "NWX964",
 // Datos reales de combustible que diste:
@@ -973,6 +1296,7 @@ else if (currentView === 'historial') content = renderHistorial();
 else if (currentView === 'bip') content = renderCanonBIP();
 else if (currentView === 'finanzas') content = renderFinanzas();
 else if (currentView === 'mantenimiento') content = renderMantenimiento();
+else if (currentView === 'rutaspeajes') content = renderRutasPeajes();
 
 app.innerHTML = '<div class="app-container"><header class="app-header"><button type="button" class="theme-toggle" onclick="toggleTema()">' + (temaOscuro?'☀️':'🌙') + '</button><h1>🚗 ' + (vehicleConfig.empresa || 'Transporte Ejecutivo') + '</h1><p class="subtitle">' + vehicleConfig.marca + ' ' + vehicleConfig.modelo + ' ' + vehicleConfig.motor + ' ' + vehicleConfig.anio + ' · Placa ' + vehicleConfig.placa + '</p></header>' + renderNav() + '<main class="app-main">' + content + '</main></div>';
 }
@@ -987,6 +1311,7 @@ var views = [
 {k:'bip',l:'🏢 Canon BIP'},
 {k:'finanzas',l:'💹 Finanzas'},
 {k:'mantenimiento',l:'🔧 Mantenim.'},
+{k:'rutaspeajes',l:'🛣️ Rutas/Peajes'},
 {k:'historial',l:'📚 Historial'}
 ];
 var html = '<nav class="nav-bar">';
@@ -1882,6 +2207,248 @@ try { localStorage.setItem('cotizador_gastos', JSON.stringify(gastos)); } catch(
 renderApp();
 }
 
+// ============================================================================================
+// INTERFAZ: MÓDULO RUTAS Y PEAJES (Buscador, Administrar Peajes, Administrar Rutas)
+// ============================================================================================
+
+function renderRutasPeajes() {
+var sub = window.__rutasPeajesSubvista || 'buscador';
+var html = '<div class="card"><h2>🛣️ Rutas y Peajes</h2>';
+html += '<div class="btn-group" style="margin-top:0"><button type="button" class="btn-secondary" style="' + (sub==='buscador'?'background:var(--accent);color:white':'') + '" onclick="cambiarSubvistaRutasPeajes(\'buscador\')">🔎 Buscador</button><button type="button" class="btn-secondary" style="' + (sub==='peajes'?'background:var(--accent);color:white':'') + '" onclick="cambiarSubvistaRutasPeajes(\'peajes\')">🎫 Peajes</button><button type="button" class="btn-secondary" style="' + (sub==='rutas'?'background:var(--accent);color:white':'') + '" onclick="cambiarSubvistaRutasPeajes(\'rutas\')">🗺️ Rutas</button></div></div>';
+
+if (sub === 'buscador') html += renderBuscadorLugares();
+else if (sub === 'peajes') html += renderAdministrarPeajes();
+else if (sub === 'rutas') html += renderAdministrarRutas();
+
+return html;
+}
+
+function cambiarSubvistaRutasPeajes(sub) {
+window.__rutasPeajesSubvista = sub;
+renderApp();
+}
+
+// ---------- BUSCADOR ----------
+function renderBuscadorLugares() {
+var query = window.__buscadorQuery || '';
+var resultados = SolarDB.buscarLugares(query);
+var html = '<div class="card"><h2>🔎 Buscador de lugares</h2>';
+html += '<input type="text" class="input" id="inputBuscadorLugares" placeholder="Escribe ciudad, municipio..." value="' + query.replace(/"/g,'&quot;') + '" oninput="buscarLugaresEnVivo(this.value)">';
+html += '<div class="hint" style="text-align:left;margout:8px 0 0">Hoy busca ciudades y municipios. Está preparado para crecer a hoteles, aeropuertos, clínicas, empresas, centros comerciales, terminales y sitios turísticos sin rediseñarse.</div>';
+html += '<div class="hist-list" style="margin-top:12px">';
+if (resultados.length === 0) { html += '<div class="empty-state"><div class="empty-state-text">Sin resultados</div></div>'; }
+resultados.slice(0, 30).forEach(function(l) {
+html += '<div class="hist-item"><div class="hist-route">' + l.nombre + '</div><div class="hist-details"><span>' + iconoTipoLugar(l.tipo) + ' ' + l.tipo + '</span><span>' + (l.departamento||'') + '</span></div></div>';
+});
+html += '</div></div>';
+
+html += '<div class="card"><h2>➕ Agregar nuevo lugar</h2><div class="form-grid">';
+html += '<div class="form-group full"><label>Nombre</label><input type="text" id="nuevoLugarNombre" class="input" placeholder="Ej: Aeropuerto Ernesto Cortissoz"></div>';
+html += '<div class="form-group"><label>Tipo</label><select id="nuevoLugarTipo" class="input"><option value="ciudad">Ciudad/Municipio</option><option value="aeropuerto">Aeropuerto</option><option value="hotel">Hotel</option><option value="clinica">Clínica</option><option value="empresa">Empresa</option><option value="centro_comercial">Centro comercial</option><option value="terminal">Terminal</option><option value="turistico">Sitio turístico</option></select></div>';
+html += '<div class="form-group"><label>Departamento</label><input type="text" id="nuevoLugarDepto" class="input" placeholder="Atlántico"></div>';
+html += '</div><button type="button" class="btn-primary" onclick="crearLugarUI()">💾 Guardar lugar</button><div id="lugarMsg"></div></div>';
+return html;
+}
+
+function iconoTipoLugar(tipo) {
+var iconos = {ciudad:'🏙️', municipio:'🏘️', aeropuerto:'✈️', hotel:'🏨', clinica:'🏥', empresa:'🏢', centro_comercial:'🛍️', terminal:'🚌', turistico:'📍'};
+return iconos[tipo] || '📍';
+}
+
+function buscarLugaresEnVivo(q) {
+window.__buscadorQuery = q;
+renderApp();
+var input = document.getElementById('inputBuscadorLugares');
+if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+}
+
+function crearLugarUI() {
+var nombre = document.getElementById('nuevoLugarNombre').value.trim();
+var tipo = document.getElementById('nuevoLugarTipo').value;
+var depto = document.getElementById('nuevoLugarDepto').value.trim();
+if (!nombre) { document.getElementById('lugarMsg').innerHTML = '<div class="alert alert-warn">⚠️ Escribe un nombre</div>'; return; }
+var res = SolarDB.crearLugar({nombre: nombre, tipo: tipo, departamento: depto});
+if (!res.ok) { document.getElementById('lugarMsg').innerHTML = '<div class="alert alert-warn">⚠️ ' + res.error + '</div>'; return; }
+document.getElementById('lugarMsg').innerHTML = '<div class="alert alert-success">✅ "' + nombre + '" agregado — ya aparece en el buscador</div>';
+document.getElementById('nuevoLugarNombre').value = '';
+document.getElementById('nuevoLugarDepto').value = '';
+}
+
+// ---------- ADMINISTRAR PEAJES ----------
+function renderAdministrarPeajes() {
+var peajes = SolarDB.listarPeajes();
+var html = '<div class="card"><h2>🎫 Administrar Peajes</h2><p class="hint" style="text-align:left;margin-top:0">El nombre y valor de cada peaje solo se editan aquí. Las rutas únicamente los seleccionan — nunca los crean ni los duplican.</p>';
+html += '<div class="hist-list">';
+peajes.forEach(function(p) {
+html += '<div class="cost-section" id="peajeCard_' + p.id + '">';
+html += '<div style="display:flex;justify-content:space-between;align-items:center"><strong>' + p.nombre + '</strong><span style="font-size:11px;color:' + (p.estado==='activo'?'#059669':'#dc2626') + ';font-weight:700;text-transform:uppercase">' + p.estado + '</span></div>';
+html += '<div class="form-grid" style="margin-top:8px">';
+html += '<div class="form-group"><label>Nombre</label><input type="text" id="peajeNombre_' + p.id + '" class="input" value="' + p.nombre.replace(/"/g,'&quot;') + '"></div>';
+html += '<div class="form-group"><label>Valor Categoría I</label><input type="number" id="peajeValor_' + p.id + '" class="input" value="' + p.valorCategoriaI + '"></div>';
+html += '<div class="form-group"><label>Departamento</label><input type="text" id="peajeDepto_' + p.id + '" class="input" value="' + (p.departamento||'').replace(/"/g,'&quot;') + '"></div>';
+html += '<div class="form-group"><label>Municipio</label><input type="text" id="peajeMunicipio_' + p.id + '" class="input" value="' + (p.municipio||'').replace(/"/g,'&quot;') + '"></div>';
+html += '<div class="form-group"><label>Estado</label><select id="peajeEstado_' + p.id + '" class="input"><option value="activo"' + (p.estado==='activo'?' selected':'') + '>Activo</option><option value="inactivo"' + (p.estado==='inactivo'?' selected':'') + '>Inactivo</option></select></div>';
+html += '<div class="form-group full"><label>Observaciones</label><input type="text" id="peajeObs_' + p.id + '" class="input" value="' + (p.observaciones||'').replace(/"/g,'&quot;') + '"></div>';
+html += '</div><button type="button" class="btn-secondary" style="width:100%;margin-top:8px" onclick="guardarPeajeUI(\'' + p.id + '\')">💾 Guardar</button>';
+html += '</div>';
+});
+html += '</div></div>';
+
+html += '<div class="card"><h2>➕ Crear nuevo peaje</h2><div class="form-grid">';
+html += '<div class="form-group full"><label>Nombre</label><input type="text" id="nuevoPeajeNom" class="input" placeholder="Ej: Peaje Galapa"></div>';
+html += '<div class="form-group"><label>Valor Categoría I</label><input type="number" id="nuevoPeajeVal" class="input" placeholder="13300"></div>';
+html += '<div class="form-group"><label>Departamento</label><input type="text" id="nuevoPeajeDepto" class="input" placeholder="Atlántico"></div>';
+html += '<div class="form-group full"><label>Municipio</label><input type="text" id="nuevoPeajeMunicipio" class="input" placeholder="Galapa"></div>';
+html += '</div><button type="button" class="btn-primary" onclick="crearPeajeUI()">💾 Crear peaje</button><div id="nuevoPeajeMsg"></div></div>';
+return html;
+}
+
+function guardarPeajeUI(id) {
+var cambios = {
+nombre: document.getElementById('peajeNombre_'+id).value.trim(),
+valorCategoriaI: parseFloat(document.getElementById('peajeValor_'+id).value) || 0,
+departamento: document.getElementById('peajeDepto_'+id).value.trim(),
+municipio: document.getElementById('peajeMunicipio_'+id).value.trim(),
+estado: document.getElementById('peajeEstado_'+id).value,
+observaciones: document.getElementById('peajeObs_'+id).value.trim()
+};
+var res = SolarDB.editarPeaje(id, cambios);
+var card = document.getElementById('peajeCard_'+id);
+if (card) {
+var aviso = document.createElement('div');
+aviso.className = 'alert alert-success';
+aviso.textContent = '✅ Guardado — todas las rutas que usan este peaje ya quedaron actualizadas';
+card.appendChild(aviso);
+setTimeout(function(){ renderApp(); }, 1200);
+}
+}
+
+function crearPeajeUI() {
+var nombre = document.getElementById('nuevoPeajeNom').value.trim();
+var valor = parseFloat(document.getElementById('nuevoPeajeVal').value) || 0;
+var depto = document.getElementById('nuevoPeajeDepto').value.trim();
+var municipio = document.getElementById('nuevoPeajeMunicipio').value.trim();
+if (!nombre || valor <= 0) { document.getElementById('nuevoPeajeMsg').innerHTML = '<div class="alert alert-warn">⚠️ Escribe nombre y valor</div>'; return; }
+var res = SolarDB.crearPeaje({nombre: nombre, valorCategoriaI: valor, departamento: depto, municipio: municipio});
+if (!res.ok) { document.getElementById('nuevoPeajeMsg').innerHTML = '<div class="alert alert-warn">⚠️ ' + res.error + '</div>'; return; }
+renderApp();
+}
+
+// ---------- ADMINISTRAR RUTAS ----------
+function renderAdministrarRutas() {
+var origenSel = window.__rutaOrigenId || 'lugar_barranquilla';
+var destinoSel = window.__rutaDestinoId || null;
+
+var html = '<div class="card"><h2>🗺️ Administrar Rutas</h2>';
+html += '<div class="form-grid"><div class="form-group"><label>Origen</label><select id="selRutaOrigen" class="input" onchange="cambiarSelectorRutaAdmin()">' + SolarDB.LUGARES.map(function(l){return '<option value="'+l.id+'"'+(l.id===origenSel?' selected':'')+'>'+l.nombre+'</option>';}).join('') + '</select></div>';
+html += '<div class="form-group"><label>Destino</label><select id="selRutaDestino" class="input" onchange="cambiarSelectorRutaAdmin()"><option value="">Selecciona...</option>' + SolarDB.LUGARES.filter(function(l){return l.id!==origenSel;}).map(function(l){return '<option value="'+l.id+'"'+(l.id===destinoSel?' selected':'')+'>'+l.nombre+'</option>';}).join('') + '</select></div></div></div>';
+
+if (!destinoSel) {
+html += '<div class="card"><div class="alert alert-info">Selecciona un origen y destino para ver o crear rutas entre ellos.</div></div>';
+return html;
+}
+
+var rutas = SolarDB.rutasEntre(origenSel, destinoSel);
+var origenLugar = SolarDB.obtenerLugar(origenSel);
+var destinoLugar = SolarDB.obtenerLugar(destinoSel);
+
+html += '<div class="card"><h2>Rutas: ' + origenLugar.nombre + ' ↔ ' + destinoLugar.nombre + ' (' + rutas.length + ')</h2>';
+if (rutas.length === 0) { html += '<div class="empty-state"><div class="empty-state-text">Aún no hay rutas registradas entre estos lugares</div></div>'; }
+rutas.forEach(function(r) {
+var tot = SolarDB.calcularTotalesRuta(r);
+var peajesOrdenados = r.peajesRuta.slice().sort(function(a,b){return a.orden-b.orden;});
+html += '<div class="cost-section" id="rutaCard_' + r.id + '">';
+html += '<div style="display:flex;justify-content:space-between;align-items:center"><strong>' + r.nombreRuta + '</strong><span style="font-size:11px;color:' + (r.estado==='activo'?'#059669':'#dc2626') + ';font-weight:700;text-transform:uppercase">' + r.estado + '</span></div>';
+html += '<div class="form-grid" style="margin-top:8px">';
+html += '<div class="form-group full"><label>Nombre de la ruta</label><input type="text" id="rutaNombre_' + r.id + '" class="input" value="' + r.nombreRuta.replace(/"/g,'&quot;') + '"></div>';
+html += '<div class="form-group"><label>Kilómetros</label><input type="number" id="rutaKm_' + r.id + '" class="input" value="' + (r.kilometros!=null?r.kilometros:'') + '" placeholder="Sin dato aún"></div>';
+html += '<div class="form-group"><label>Tiempo (min)</label><input type="number" id="rutaTiempo_' + r.id + '" class="input" value="' + (r.tiempoMinutos!=null?r.tiempoMinutos:'') + '" placeholder="Sin dato aún"></div>';
+html += '<div class="form-group full"><label>Estado</label><select id="rutaEstado_' + r.id + '" class="input"><option value="activo"' + (r.estado==='activo'?' selected':'') + '>Activo</option><option value="inactivo"' + (r.estado==='inactivo'?' selected':'') + '>Inactivo</option></select></div>';
+html += '</div><button type="button" class="btn-secondary" style="width:100%;margin-top:8px" onclick="guardarRutaAdminUI(\'' + r.id + '\')">💾 Guardar datos de la ruta</button>';
+
+html += '<h4 style="margin:14px 0 8px">🎫 Peajes de esta ruta (orden ida)</h4>';
+if (peajesOrdenados.length === 0) { html += '<div class="hint" style="text-align:left;margin:0">Sin peajes agregados aún</div>'; }
+peajesOrdenados.forEach(function(pr, idx) {
+var peaje = SolarDB.obtenerPeaje(pr.peajeId);
+if (!peaje) return;
+html += '<div class="cost-row"><span>' + (idx+1) + '. ' + peaje.nombre + '</span><span>' + formatCOP(peaje.valorCategoriaI) + ' ';
+html += '<a href="#" onclick="moverPeajeRutaUI(\'' + r.id + '\',\'' + pr.peajeId + '\',\'arriba\');return false" style="margin-left:6px">⬆️</a>';
+html += '<a href="#" onclick="moverPeajeRutaUI(\'' + r.id + '\',\'' + pr.peajeId + '\',\'abajo\');return false" style="margin-left:4px">⬇️</a>';
+html += '<a href="#" onclick="quitarPeajeRutaUI(\'' + r.id + '\',\'' + pr.peajeId + '\');return false" style="color:#dc2626;margin-left:6px">✕</a></span></div>';
+});
+var peajesDisponibles = SolarDB.listarPeajes().filter(function(p){ return !peajesOrdenados.some(function(pr){return pr.peajeId===p.id;}); });
+if (peajesDisponibles.length) {
+html += '<div class="form-grid" style="margin-top:8px"><div class="form-group full"><label>Agregar peaje existente</label><select id="selPeajeAgregar_' + r.id + '" class="input">' + peajesDisponibles.map(function(p){return '<option value="'+p.id+'">'+p.nombre+' ('+formatCOP(p.valorCategoriaI)+')</option>';}).join('') + '</select></div></div>';
+html += '<button type="button" class="btn-secondary" style="width:100%;margin-top:4px" onclick="agregarPeajeRutaUI(\'' + r.id + '\')">➕ Agregar peaje seleccionado</button>';
+}
+
+html += '<div class="cost-section highlight" style="margin-top:12px">';
+html += '<div class="cost-row"><span>Cantidad de peajes</span><span>' + tot.cantidadPeajes + '</span></div>';
+html += '<div class="cost-row"><span>Total solo ida</span><span class="cost-real">' + formatCOP(tot.totalSoloIda) + '</span></div>';
+html += '<div class="cost-row total"><span>Total ida y regreso</span><span class="cost-quote">' + formatCOP(tot.totalIdaRegreso) + '</span></div>';
+html += '</div></div>';
+});
+html += '</div>';
+
+html += '<div class="card"><h2>➕ Crear nueva ruta ' + origenLugar.nombre + ' ↔ ' + destinoLugar.nombre + '</h2><div class="form-grid">';
+html += '<div class="form-group full"><label>Nombre de la ruta</label><input type="text" id="nuevaRutaNombre" class="input" placeholder="Ej: Vía Circunvalar"></div>';
+html += '<div class="form-group"><label>Kilómetros (opcional)</label><input type="number" id="nuevaRutaKm" class="input" placeholder="Déjalo vacío si no lo sabes aún"></div>';
+html += '<div class="form-group"><label>Tiempo en minutos (opcional)</label><input type="number" id="nuevaRutaTiempo" class="input" placeholder="Déjalo vacío si no lo sabes aún"></div>';
+html += '</div><button type="button" class="btn-primary" onclick="crearRutaUI()">💾 Crear ruta</button><div id="nuevaRutaMsg"></div></div>';
+return html;
+}
+
+function cambiarSelectorRutaAdmin() {
+window.__rutaOrigenId = document.getElementById('selRutaOrigen').value;
+window.__rutaDestinoId = document.getElementById('selRutaDestino').value || null;
+renderApp();
+}
+
+function guardarRutaAdminUI(rutaId) {
+var kmVal = document.getElementById('rutaKm_'+rutaId).value;
+var tiempoVal = document.getElementById('rutaTiempo_'+rutaId).value;
+SolarDB.editarRuta(rutaId, {
+nombreRuta: document.getElementById('rutaNombre_'+rutaId).value.trim(),
+kilometros: kmVal === '' ? null : parseFloat(kmVal),
+tiempoMinutos: tiempoVal === '' ? null : parseFloat(tiempoVal),
+estado: document.getElementById('rutaEstado_'+rutaId).value
+});
+renderApp();
+}
+
+function agregarPeajeRutaUI(rutaId) {
+var sel = document.getElementById('selPeajeAgregar_'+rutaId);
+if (!sel || !sel.value) return;
+SolarDB.agregarPeajeARuta(rutaId, sel.value);
+renderApp();
+}
+
+function quitarPeajeRutaUI(rutaId, peajeId) {
+SolarDB.quitarPeajeDeRuta(rutaId, peajeId);
+renderApp();
+}
+
+function moverPeajeRutaUI(rutaId, peajeId, direccion) {
+SolarDB.moverPeajeEnRuta(rutaId, peajeId, direccion);
+renderApp();
+}
+
+function crearRutaUI() {
+var origenId = window.__rutaOrigenId;
+var destinoId = window.__rutaDestinoId;
+var nombre = document.getElementById('nuevaRutaNombre').value.trim() || 'Ruta principal';
+var kmVal = document.getElementById('nuevaRutaKm').value;
+var tiempoVal = document.getElementById('nuevaRutaTiempo').value;
+if (!destinoId) return;
+SolarDB.crearRuta({
+origenId: origenId, destinoId: destinoId, nombreRuta: nombre,
+kilometros: kmVal === '' ? null : parseFloat(kmVal),
+tiempoMinutos: tiempoVal === '' ? null : parseFloat(tiempoVal),
+peajesRuta: []
+});
+renderApp();
+}
+
 function renderHistorial() {
 if (historial.length === 0) {
 return '<div class="card"><h2>📚 Historial de Cotizaciones</h2><div class="empty-state"><div class="empty-state-icon">📋</div><div class="empty-state-text">No hay cotizaciones guardadas aún</div></div></div>';
@@ -1936,6 +2503,17 @@ window.guardarOdometro = guardarOdometro;
 window.guardarItemMantenimiento = guardarItemMantenimiento;
 window.registrarMantenimientoRealizado = registrarMantenimientoRealizado;
 window.guardarPDF = guardarPDF;
+window.cambiarSubvistaRutasPeajes = cambiarSubvistaRutasPeajes;
+window.buscarLugaresEnVivo = buscarLugaresEnVivo;
+window.crearLugarUI = crearLugarUI;
+window.guardarPeajeUI = guardarPeajeUI;
+window.crearPeajeUI = crearPeajeUI;
+window.cambiarSelectorRutaAdmin = cambiarSelectorRutaAdmin;
+window.guardarRutaAdminUI = guardarRutaAdminUI;
+window.agregarPeajeRutaUI = agregarPeajeRutaUI;
+window.quitarPeajeRutaUI = quitarPeajeRutaUI;
+window.moverPeajeRutaUI = moverPeajeRutaUI;
+window.crearRutaUI = crearRutaUI;
 window.compartirPDF = compartirPDF;
 
 renderApp();
